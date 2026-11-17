@@ -25,7 +25,12 @@ from PyQt6.QtWidgets import (
     QGraphicsDropShadowEffect, QDateEdit
 )
 
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "widget_data.json")
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATA_FILE = os.path.join(APP_DIR, "widget_data.json")
 
 KOREAN_DAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 SHORT_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
