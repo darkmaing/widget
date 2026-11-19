@@ -919,6 +919,105 @@ class OutlookWorker(QThread):
 
         raise last_err if last_err else RuntimeError("Classic Outlook 연결 실패")
 
+    def _connect_new_outlook(self, pythoncom, win32com_client):
+        import subprocess
+        import time
+
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq olk.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "olk.exe" not in result.stdout.lower():
+                raise RuntimeError("새 Outlook(olk.exe)이 실행 중이 아닙니다.")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"새 Outlook 프로세스 확인 실패: {e}")
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                outlook = None
+                try:
+                    unk = pythoncom.GetActiveObject("Outlook.Application")
+                    disp = unk.QueryInterface(pythoncom.IID_IDispatch)
+                    outlook = win32com_client.Dispatch(disp)
+                except Exception:
+                    pass
+
+                if outlook is None:
+                    try:
+                        import win32com.client.dynamic
+                        outlook = win32com.client.dynamic.Dispatch("Outlook.Application")
+                    except Exception:
+                        outlook = win32com_client.Dispatch("Outlook.Application")
+
+                namespace = outlook.GetNamespace("MAPI")
+                try:
+                    namespace.Logon("", "", False, False)
+                except Exception:
+                    pass
+
+                candidate_inboxes = []
+                try:
+                    def_inbox = namespace.GetDefaultFolder(6)
+                    if def_inbox is not None:
+                        candidate_inboxes.append(def_inbox)
+                except Exception:
+                    pass
+
+                try:
+                    for store in namespace.Stores:
+                        try:
+                            st_inbox = store.GetDefaultFolder(6)
+                            if st_inbox is not None and st_inbox not in candidate_inboxes:
+                                candidate_inboxes.append(st_inbox)
+                        except Exception:
+                            pass
+                        try:
+                            root_f = store.GetRootFolder()
+                            for sf in root_f.Folders:
+                                n_lower = str(getattr(sf, "Name", "")).strip().lower()
+                                if n_lower in ("받은 편지함", "받은편지함", "inbox") and sf not in candidate_inboxes:
+                                    candidate_inboxes.append(sf)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                chosen_inbox = None
+                max_cnt = -1
+                for ib in candidate_inboxes:
+                    try:
+                        cnt = int(ib.Items.Count)
+                        if cnt > max_cnt:
+                            max_cnt = cnt
+                            chosen_inbox = ib
+                    except Exception:
+                        pass
+
+                if chosen_inbox is None and candidate_inboxes:
+                    chosen_inbox = candidate_inboxes[0]
+
+                if chosen_inbox is None:
+                    raise RuntimeError("새 Outlook 받은 편지함을 찾을 수 없습니다.")
+
+                unread_total = 0
+                for ib in candidate_inboxes:
+                    try:
+                        unread_total += int(getattr(ib, "UnReadItemCount", 0))
+                    except Exception:
+                        pass
+
+                return outlook, namespace, chosen_inbox, unread_total
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(1)
+
+        raise last_err if last_err else RuntimeError("새 Outlook 연결 실패")
+
     def run(self):
         pythoncom = None
         try:
@@ -927,7 +1026,10 @@ class OutlookWorker(QThread):
             pythoncom = _pythoncom
             pythoncom.CoInitialize()
 
-            outlook, namespace, inbox, unread_total = self._connect_classic_outlook(pythoncom, win32com.client)
+            try:
+                outlook, namespace, inbox, unread_total = self._connect_new_outlook(pythoncom, win32com.client)
+            except Exception:
+                outlook, namespace, inbox, unread_total = self._connect_classic_outlook(pythoncom, win32com.client)
 
             items = inbox.Items
             items.Sort("[ReceivedTime]", True)
@@ -1029,6 +1131,90 @@ class OutlookWorker(QThread):
                     pythoncom.CoUninitialize()
                 except Exception:
                     pass
+
+
+class VideoRecordWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, fps: int = 10):
+        super().__init__()
+        self.path = path
+        self.fps = fps
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            import mss
+            import numpy as np
+            import imageio
+            import time
+
+            with mss.MSS() as sct:
+                mon = sct.monitors[0]  # 전체 가상 데스크탑(멀티모니터 합산)
+                w = mon["width"] if mon["width"] % 2 == 0 else mon["width"] - 1
+                h = mon["height"] if mon["height"] % 2 == 0 else mon["height"] - 1
+                writer = imageio.get_writer(
+                    self.path,
+                    fps=float(self.fps),
+                    codec="libx264",
+                    quality=6,
+                    macro_block_size=None,
+                    ffmpeg_params=["-pix_fmt", "yuv420p"],
+                )
+                frame_time = 1.0 / self.fps
+                while not self._stop:
+                    t0 = time.time()
+                    img = np.array(sct.grab(mon))
+                    frame = img[:h, :w, 2::-1]  # BGRA → RGB, 짝수 크기로 자름
+                    writer.append_data(frame)
+                    elapsed = time.time() - t0
+                    if elapsed < frame_time:
+                        time.sleep(frame_time - elapsed)
+                writer.close()
+            self.finished.emit(self.path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class AudioRecordWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, samplerate: int = 44100):
+        super().__init__()
+        self.path = path
+        self.samplerate = samplerate
+        self._stop = False
+        self._frames = []
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            import sounddevice as sd
+            import numpy as np
+            import scipy.io.wavfile as wavfile
+
+            self._frames = []
+
+            def callback(indata, frames, time_info, status):
+                self._frames.append(indata.copy())
+
+            with sd.InputStream(samplerate=self.samplerate, channels=1, dtype="int16", callback=callback):
+                while not self._stop:
+                    sd.sleep(50)
+
+            if self._frames:
+                audio = np.concatenate(self._frames, axis=0)
+                wavfile.write(self.path, self.samplerate, audio)
+            self.finished.emit(self.path)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class DataManager:
@@ -1171,7 +1357,7 @@ class CircularTimerWidget(QWidget):
 
 class DesktopWidget(QMainWindow):
     BAR_HEIGHT = 48
-    EXPANDED_HEIGHT = 450
+    EXPANDED_HEIGHT = 225
     OPIC_BANNER_HEIGHT = 104
     MINI_WIDTH = 152
     MINI_HEIGHT = 38
@@ -1211,6 +1397,10 @@ class DesktopWidget(QMainWindow):
         self.unread_mail_count = self.dm.data.get("cached_unread_count", 0)
         self.mail_worker = None
         self.ticker_idx = 0
+        self.capture_dir = os.path.join(APP_DIR, "captures")
+        os.makedirs(self.capture_dir, exist_ok=True)
+        self.video_worker = None
+        self.audio_worker = None
 
         self.selected_date = date.today()
         self.cal_year = self.selected_date.year
@@ -1331,9 +1521,7 @@ class DesktopWidget(QMainWindow):
             y = max(0, min(pos[1], screen.height() - self.BAR_HEIGHT))
             self.move(x, y)
         else:
-            x = screen.x() + (screen.width() - self.bar_width) // 2
-            y = screen.y() + 6
-            self.move(x, y)
+            self.move(screen.x() + 6, screen.y() + 6)
 
     def update_window_flags(self):
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowMinimizeButtonHint
@@ -1546,6 +1734,7 @@ class DesktopWidget(QMainWindow):
             ("📅 일정", 2),
             ("📝 메모", 3),
             ("⏱️ 타이머", 4),
+            ("📸 캡처", 5),
         ]
         for label, idx in tabs:
             btn = QPushButton(label)
@@ -1792,6 +1981,7 @@ class DesktopWidget(QMainWindow):
         self.stack.addWidget(self.build_calendar_page())
         self.stack.addWidget(self.build_memo_page())
         self.stack.addWidget(self.build_timer_page())
+        self.stack.addWidget(self.build_capture_page())
         panel_layout.addWidget(self.stack, 1)
 
         self.root_layout.addWidget(self.panel_frame, 1)
@@ -2053,6 +2243,20 @@ class DesktopWidget(QMainWindow):
         if typed_norm and (typed_norm == target_norm or typed_norm == target_no_punct):
             self.opic_completing = True
             self.dm.data["opic_count"] = self.dm.data.get("opic_count", 0) + 1
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if "opic_dates" not in self.dm.data:
+                self.dm.data["opic_dates"] = []
+            self.dm.data["opic_dates"].append({
+                "date": today_str,
+                "time": now_str,
+                "mode": self.opic_mode,
+                "sentence": self.current_opic.get("en", ""),
+                "ko": ko_text,
+                "category": self.current_opic.get("category", ""),
+            })
+            # 완료 시 다음 모드를 반대로 전환 (따라쓰기 → 영작 → 따라쓰기 교대)
+            self.dm.data["opic_next_mode"] = "compose" if self.opic_mode == "typing" else "typing"
             self.dm.save()
             self.opic_streak_lbl.setText(f"🔥 누적 {self.dm.data['opic_count']}회 완료")
             if self.opic_mode == "typing":
@@ -2595,7 +2799,7 @@ class DesktopWidget(QMainWindow):
             )
         if self.mail_worker is not None and self.mail_worker.isRunning():
             return
-        self.mail_status_lbl.setText("클래식 Outlook 받은편지함 동기화 중...")
+        self.mail_status_lbl.setText("Outlook 받은편지함 동기화 중...")
         self.mail_worker = OutlookWorker(max_items=40)
         self.mail_worker.finished.connect(self.on_outlook_loaded)
         self.mail_worker.start()
@@ -2675,10 +2879,10 @@ class DesktopWidget(QMainWindow):
         reason = self.diagnose_outlook_error(err_msg)
         detail = (err_msg or "알 수 없는 COM 오류").strip()
         lbl = QLabel(
-            f"📬 클래식 Outlook 연결 실패 원인: [{reason}]\n\n"
+            f"📬 Outlook 연결 실패 원인: [{reason}]\n\n"
             f"• 상세 오류 메시지: {detail}\n"
             "• 해결 방법:\n"
-            "  1) '새 Outlook(New)'이 아닌 '클래식 Outlook(OUTLOOK.EXE)'이 켜져 있는지 확인하세요.\n"
+            "  1) 새 Outlook(olk.exe) 또는 클래식 Outlook(OUTLOOK.EXE) 중 하나가 실행 중인지 확인하세요.\n"
             "  2) Outlook과 위젯의 실행 권한(일반 vs 관리자)이 다르면 연결이 거부될 수 있습니다. "
             "폴더의 run_widget.bat 또는 DesktopWidget.exe를 직접 더블클릭해 실행해 주세요."
         )
@@ -3147,6 +3351,7 @@ class DesktopWidget(QMainWindow):
         month_days = cal.monthdatescalendar(self.cal_year, self.cal_month)
         schedules = self.dm.data.get("schedules", {})
         today = date.today()
+        opic_date_set = {r["date"] for r in self.dm.data.get("opic_dates", []) if "date" in r}
 
         for r_idx, week in enumerate(month_days):
             for c_idx, d in enumerate(week):
@@ -3154,19 +3359,30 @@ class DesktopWidget(QMainWindow):
                 day_events = schedules.get(d_str, [])
                 has_events = bool(day_events)
                 has_mail_event = any(ev.get("from_mail") for ev in day_events)
+                has_opic = d_str in opic_date_set
                 is_current_month = (d.month == self.cal_month)
                 is_selected = (d == self.selected_date)
                 is_today = (d == today)
 
-                btn_text = f"{d.day}•" if has_events else f"{d.day}"
+                if has_events and has_opic:
+                    btn_text = f"{d.day}•🗣"
+                elif has_opic:
+                    btn_text = f"{d.day}🗣"
+                elif has_events:
+                    btn_text = f"{d.day}•"
+                else:
+                    btn_text = f"{d.day}"
                 btn = QPushButton(btn_text)
                 btn.setFixedHeight(24)
                 btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                tooltip_parts = []
                 if has_events:
-                    btn.setToolTip(
-                        f"{d_str} 일정 {len(day_events)}건"
-                        + (" (📧 메일 일정 포함)" if has_mail_event else "")
-                    )
+                    tooltip_parts.append(f"일정 {len(day_events)}건" + (" (📧 메일 포함)" if has_mail_event else ""))
+                if has_opic:
+                    cnt = sum(1 for r in self.dm.data.get("opic_dates", []) if r.get("date") == d_str)
+                    tooltip_parts.append(f"🗣️ 오픽 {cnt}회 완료")
+                if tooltip_parts:
+                    btn.setToolTip(f"{d_str} " + " / ".join(tooltip_parts))
 
                 if is_selected:
                     bg = "#6366F1"
@@ -3249,14 +3465,18 @@ class DesktopWidget(QMainWindow):
                 child.widget().deleteLater()
 
         day_list = self.dm.data.get("schedules", {}).get(d_key, [])
-        if not day_list:
+        opic_records = [r for r in self.dm.data.get("opic_dates", []) if r.get("date") == d_key]
+
+        if not day_list and not opic_records:
             empty = QLabel("이 날짜에 등록된 일정이 없습니다.")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setStyleSheet("color: #64748B; font-size: 11px; padding: 20px;")
             self.sched_list_layout.insertWidget(0, empty)
             return
 
-        for idx, item in enumerate(day_list):
+        insert_idx = 0
+
+        for item in day_list:
             is_mail = bool(item.get("from_mail"))
             card = QFrame()
             if is_mail:
@@ -3330,7 +3550,56 @@ class DesktopWidget(QMainWindow):
             del_btn.clicked.connect(lambda checked, dk=d_key, i=sid: self.delete_schedule(dk, i))
             row.addWidget(del_btn)
 
-            self.sched_list_layout.insertWidget(idx, card)
+            self.sched_list_layout.insertWidget(insert_idx, card)
+            insert_idx += 1
+
+        for rec in opic_records:
+            mode_label = "✍️ 따라쓰기" if rec.get("mode") == "typing" else "🧠 한→영 영작"
+            time_str = rec.get("time", "")[-5:] if len(rec.get("time", "")) >= 5 else ""
+            opic_card = QFrame()
+            opic_card.setStyleSheet("""
+                QFrame {
+                    background: rgba(16, 185, 129, 0.08);
+                    border: 1px solid rgba(16, 185, 129, 0.30);
+                    border-left: 3px solid #10B981;
+                    border-radius: 5px;
+                }
+            """)
+            row = QHBoxLayout(opic_card)
+            row.setContentsMargins(10, 5, 8, 5)
+            row.setSpacing(6)
+
+            t_lbl = QLabel(time_str)
+            t_lbl.setFixedWidth(48)
+            t_lbl.setStyleSheet("color: #6EE7B7; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+            row.addWidget(t_lbl)
+
+            badge = QLabel("🗣️ 오픽")
+            badge.setStyleSheet("""
+                background: rgba(16, 185, 129, 0.22); color: #34D399;
+                border-radius: 4px; padding: 1px 5px; font-size: 9px; font-weight: bold; border: none;
+            """)
+            row.addWidget(badge)
+
+            mode_lbl = QLabel(mode_label)
+            mode_lbl.setStyleSheet("color: #A5B4FC; font-size: 10px; border: none; background: transparent;")
+            row.addWidget(mode_lbl)
+
+            text_col = QVBoxLayout()
+            text_col.setSpacing(1)
+            sentence_lbl = QLabel(rec.get("sentence", ""))
+            sentence_lbl.setWordWrap(True)
+            sentence_lbl.setStyleSheet("color: #CBD5E1; font-size: 11px; border: none; background: transparent;")
+            text_col.addWidget(sentence_lbl)
+            if rec.get("ko"):
+                ko_lbl = QLabel(f"🇰🇷 {rec['ko']}")
+                ko_lbl.setWordWrap(True)
+                ko_lbl.setStyleSheet("color: #FDE68A; font-size: 10px; border: none; background: transparent;")
+                text_col.addWidget(ko_lbl)
+            row.addLayout(text_col, 1)
+
+            self.sched_list_layout.insertWidget(insert_idx, opic_card)
+            insert_idx += 1
 
     # ---------------------------------------------------------
     # Page 4: Sticky Memo Pad (Date-grouped & Searchable)
@@ -4151,6 +4420,247 @@ class DesktopWidget(QMainWindow):
         self.circle_timer.set_state(prog, time_str, self.timer_mode_label, self.timer_color)
 
     # ---------------------------------------------------------
+    # Page 6: Capture (Screenshot / Video / Audio)
+    # ---------------------------------------------------------
+    def build_capture_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+
+        # --- Control Row ---
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(6)
+
+        self.shot_btn = QPushButton("📸 스크린샷")
+        self.shot_btn.setFixedHeight(30)
+        self.shot_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.shot_btn.setStyleSheet("""
+            QPushButton { background: rgba(99,102,241,0.20); color: #A5B4FC;
+                border: 1px solid rgba(99,102,241,0.40); border-radius: 6px;
+                font-size: 11px; font-weight: bold; padding: 0 10px; }
+            QPushButton:hover { background: rgba(99,102,241,0.40); color: white; }
+        """)
+        self.shot_btn.clicked.connect(self.capture_screenshot)
+        ctrl_row.addWidget(self.shot_btn)
+
+        self.video_btn = QPushButton("🎬 화면 녹화")
+        self.video_btn.setFixedHeight(30)
+        self.video_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.video_btn.setStyleSheet("""
+            QPushButton { background: rgba(239,68,68,0.18); color: #FCA5A5;
+                border: 1px solid rgba(239,68,68,0.35); border-radius: 6px;
+                font-size: 11px; font-weight: bold; padding: 0 10px; }
+            QPushButton:hover { background: rgba(239,68,68,0.38); color: white; }
+        """)
+        self.video_btn.clicked.connect(self.toggle_video_record)
+        ctrl_row.addWidget(self.video_btn)
+
+        self.audio_btn = QPushButton("🎙️ 음성 녹음")
+        self.audio_btn.setFixedHeight(30)
+        self.audio_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.audio_btn.setStyleSheet("""
+            QPushButton { background: rgba(16,185,129,0.18); color: #6EE7B7;
+                border: 1px solid rgba(16,185,129,0.35); border-radius: 6px;
+                font-size: 11px; font-weight: bold; padding: 0 10px; }
+            QPushButton:hover { background: rgba(16,185,129,0.38); color: white; }
+        """)
+        self.audio_btn.clicked.connect(self.toggle_audio_record)
+        ctrl_row.addWidget(self.audio_btn)
+
+        layout.addLayout(ctrl_row)
+
+        # --- Status + Save Dir Row ---
+        info_row = QHBoxLayout()
+        self.capture_status_lbl = QLabel("준비")
+        self.capture_status_lbl.setStyleSheet("color: #94A3B8; font-size: 10px; border: none; background: transparent;")
+        info_row.addWidget(self.capture_status_lbl, 1)
+
+        open_dir_btn = QPushButton("📂 폴더 열기")
+        open_dir_btn.setFixedHeight(20)
+        open_dir_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        open_dir_btn.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.07); color: #CBD5E1;
+                border-radius: 4px; padding: 0 8px; font-size: 10px; border: none; }
+            QPushButton:hover { background: rgba(255,255,255,0.15); color: white; }
+        """)
+        open_dir_btn.clicked.connect(lambda: os.startfile(self.capture_dir))
+        info_row.addWidget(open_dir_btn)
+        layout.addLayout(info_row)
+
+        # --- File List ---
+        list_lbl = QLabel("최근 캡처 파일")
+        list_lbl.setStyleSheet("color: #64748B; font-size: 10px; font-weight: bold; border: none; background: transparent;")
+        layout.addWidget(list_lbl)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        capture_container = QWidget()
+        capture_container.setStyleSheet("background: transparent;")
+        self.capture_list_layout = QVBoxLayout(capture_container)
+        self.capture_list_layout.setContentsMargins(0, 0, 2, 0)
+        self.capture_list_layout.setSpacing(3)
+        self.capture_list_layout.addStretch()
+        scroll.setWidget(capture_container)
+        layout.addWidget(scroll, 1)
+
+        self.refresh_capture_list()
+        return page
+
+    def capture_screenshot(self):
+        self.showMinimized()
+        QTimer.singleShot(400, self._do_screenshot)
+
+    def _do_screenshot(self):
+        try:
+            screens = QApplication.screens()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved = []
+            for i, screen in enumerate(screens):
+                pixmap = screen.grabWindow(0)
+                suffix = f"_D{i + 1}" if len(screens) > 1 else ""
+                fname = f"screenshot_{stamp}{suffix}.png"
+                path = os.path.join(self.capture_dir, fname)
+                pixmap.save(path, "PNG")
+                saved.append(fname)
+            self.showNormal()
+            self.capture_status_lbl.setText(f"✅ {len(saved)}개 저장 ({len(screens)}개 디스플레이)")
+            self.refresh_capture_list()
+        except Exception as e:
+            self.showNormal()
+            self.capture_status_lbl.setText(f"❌ 캡처 실패: {e}")
+
+    def toggle_video_record(self):
+        if self.video_worker and self.video_worker.isRunning():
+            self.video_worker.stop()
+            self.video_btn.setText("🎬 화면 녹화")
+            self.capture_status_lbl.setText("🎬 녹화 중지 중...")
+        else:
+            try:
+                import mss  # noqa: F401
+                import imageio  # noqa: F401
+            except ImportError:
+                self.capture_status_lbl.setText("❌ mss, imageio 설치 필요: pip install mss imageio imageio-ffmpeg")
+                return
+            fname = datetime.now().strftime("video_%Y%m%d_%H%M%S.mp4")
+            path = os.path.join(self.capture_dir, fname)
+            self.video_worker = VideoRecordWorker(path)
+            self.video_worker.finished.connect(self._on_video_done)
+            self.video_worker.error.connect(lambda e: self.capture_status_lbl.setText(f"❌ 녹화 오류: {e}"))
+            self.video_worker.start()
+            self.video_btn.setText("⏹ 녹화 중지")
+            self.capture_status_lbl.setText(f"🔴 화면 녹화 중... → {fname}")
+            self.showMinimized()
+
+    def _on_video_done(self, path: str):
+        self.video_btn.setText("🎬 화면 녹화")
+        self.showNormal()
+        self.capture_status_lbl.setText(f"✅ 저장됨: {os.path.basename(path)}")
+        self.refresh_capture_list()
+
+    def toggle_audio_record(self):
+        if self.audio_worker and self.audio_worker.isRunning():
+            self.audio_worker.stop()
+            self.audio_btn.setText("🎙️ 음성 녹음")
+            self.capture_status_lbl.setText("🎙️ 녹음 저장 중...")
+        else:
+            try:
+                import sounddevice  # noqa: F401
+                import scipy  # noqa: F401
+            except ImportError:
+                self.capture_status_lbl.setText("❌ sounddevice, scipy 설치 필요: pip install sounddevice scipy")
+                return
+            fname = datetime.now().strftime("audio_%Y%m%d_%H%M%S.wav")
+            path = os.path.join(self.capture_dir, fname)
+            self.audio_worker = AudioRecordWorker(path)
+            self.audio_worker.finished.connect(self._on_audio_done)
+            self.audio_worker.error.connect(lambda e: self.capture_status_lbl.setText(f"❌ 녹음 오류: {e}"))
+            self.audio_worker.start()
+            self.audio_btn.setText("⏹ 녹음 중지")
+            self.capture_status_lbl.setText(f"🔴 음성 녹음 중... → {fname}")
+
+    def _on_audio_done(self, path: str):
+        self.audio_btn.setText("🎙️ 음성 녹음")
+        self.capture_status_lbl.setText(f"✅ 저장됨: {os.path.basename(path)}")
+        self.refresh_capture_list()
+
+    def refresh_capture_list(self):
+        if not hasattr(self, "capture_list_layout"):
+            return
+        while self.capture_list_layout.count() > 1:
+            child = self.capture_list_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        try:
+            files = sorted(
+                [f for f in os.listdir(self.capture_dir)
+                 if f.lower().endswith((".png", ".mp4", ".wav"))],
+                reverse=True
+            )[:20]
+        except Exception:
+            files = []
+
+        if not files:
+            lbl = QLabel("캡처 파일이 없습니다.")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color: #475569; font-size: 11px; padding: 20px;")
+            self.capture_list_layout.insertWidget(0, lbl)
+            return
+
+        icons = {".png": "📸", ".mp4": "🎬", ".wav": "🎙️"}
+        for i, fname in enumerate(files):
+            ext = os.path.splitext(fname)[1].lower()
+            icon = icons.get(ext, "📄")
+            full_path = os.path.join(self.capture_dir, fname)
+
+            card = QFrame()
+            card.setStyleSheet("""
+                QFrame { background: rgba(255,255,255,0.04);
+                    border: 1px solid rgba(255,255,255,0.08); border-radius: 5px; }
+            """)
+            row = QHBoxLayout(card)
+            row.setContentsMargins(8, 4, 6, 4)
+            row.setSpacing(6)
+
+            name_lbl = QLabel(f"{icon} {fname}")
+            name_lbl.setStyleSheet("color: #CBD5E1; font-size: 10px; border: none; background: transparent;")
+            name_lbl.setWordWrap(False)
+            row.addWidget(name_lbl, 1)
+
+            open_btn = QPushButton("열기")
+            open_btn.setFixedHeight(18)
+            open_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            open_btn.setStyleSheet("""
+                QPushButton { background: rgba(99,102,241,0.20); color: #A5B4FC;
+                    border-radius: 3px; padding: 0 6px; font-size: 9px; border: none; }
+                QPushButton:hover { background: #6366F1; color: white; }
+            """)
+            open_btn.clicked.connect(lambda _, p=full_path: os.startfile(p))
+            row.addWidget(open_btn)
+
+            del_btn = QPushButton("✕")
+            del_btn.setFixedSize(18, 18)
+            del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            del_btn.setStyleSheet("""
+                QPushButton { background: transparent; color: #64748B; border: none; font-size: 10px; }
+                QPushButton:hover { color: #F87171; }
+            """)
+            del_btn.clicked.connect(lambda _, p=full_path, c=card: self._delete_capture(p, c))
+            row.addWidget(del_btn)
+
+            self.capture_list_layout.insertWidget(i, card)
+
+    def _delete_capture(self, path: str, card: QFrame):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        card.deleteLater()
+        self.capture_status_lbl.setText(f"🗑️ 삭제됨: {os.path.basename(path)}")
+
+    # ---------------------------------------------------------
     # Shared Helpers, Clock, Weather & Window Dragging
     # ---------------------------------------------------------
     def init_timers(self):
@@ -4357,6 +4867,15 @@ def cleanup_previous_instances():
 
 
 def main():
+    import win32event
+    import win32api
+    import winerror
+
+    mutex = win32event.CreateMutex(None, False, "DesktopWidget_SingleInstance")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        win32api.CloseHandle(mutex)
+        sys.exit(0)
+
     cleanup_previous_instances()
     app = QApplication(sys.argv)
     app.setFont(QFont("Malgun Gothic", 10))
