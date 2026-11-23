@@ -1018,47 +1018,50 @@ class OutlookWorker(QThread):
 
         raise last_err if last_err else RuntimeError("새 Outlook 연결 실패")
 
-    def run(self):
-        pythoncom = None
+    _SKIP_FOLDER_NAMES = frozenset({
+        "받은 편지함", "받은편지함", "inbox",
+        "보낸 편지함", "보낸편지함", "sent items", "sent",
+        "지운 편지함", "지운편지함", "deleted items", "trash",
+        "정크 메일", "정크메일", "junk email", "junk",
+        "임시 보관함", "임시보관함", "drafts",
+        "알림", "rss feeds", "rss", "conversation history",
+        "outbox", "발신 대기함", "보관 폴더", "archive",
+        "sync issues", "conflicts", "local failures", "server failures",
+    })
+
+    def _scan_items(self, folder, today_date, max_items, scan_limit,
+                    unread_only=False, folder_name="", seen_ids=None):
+        """Extract email dicts from an Outlook folder's items."""
+        emails = []
         try:
-            import pythoncom as _pythoncom
-            import win32com.client
-            pythoncom = _pythoncom
-            pythoncom.CoInitialize()
-
-            try:
-                outlook, namespace, inbox, unread_total = self._connect_new_outlook(pythoncom, win32com.client)
-            except Exception:
-                outlook, namespace, inbox, unread_total = self._connect_classic_outlook(pythoncom, win32com.client)
-
-            items = inbox.Items
+            items = folder.Items
             items.Sort("[ReceivedTime]", True)
 
-            # Check whether GetFirst() or GetLast() is newer in case MAPI sorted ascending
             first_item = items.GetFirst()
             last_item = items.GetLast()
             dt_first = extract_outlook_item_datetime(first_item) if first_item is not None else None
             dt_last = extract_outlook_item_datetime(last_item) if last_item is not None else None
+            use_reverse = dt_first is not None and dt_last is not None and dt_last > dt_first
 
-            use_reverse_iter = False
-            if dt_first is not None and dt_last is not None and dt_last > dt_first:
-                use_reverse_iter = True
-
-            emails = []
-            today_date = datetime.now().date()
-            msg = items.GetLast() if use_reverse_iter else items.GetFirst()
+            msg = items.GetLast() if use_reverse else items.GetFirst()
             scanned = 0
-            scan_limit = max(50, self.max_items + 10)
 
-            while msg is not None and len(emails) < (self.max_items + 20) and scanned < scan_limit:
+            while msg is not None and len(emails) < max_items and scanned < scan_limit:
                 scanned += 1
                 try:
                     msg_class = getattr(msg, "Class", 0)
                     if msg_class in (43, 53, 54, 55, 56, 26):
+                        unread = bool(getattr(msg, "UnRead", False))
+                        if unread_only and not unread:
+                            msg = items.GetPrevious() if use_reverse else items.GetNext()
+                            continue
                         entry_id = str(getattr(msg, "EntryID", ""))
+                        if seen_ids is not None and entry_id in seen_ids:
+                            msg = items.GetPrevious() if use_reverse else items.GetNext()
+                            continue
+
                         subject = str(getattr(msg, "Subject", "") or "(제목 없음)").strip()
                         sender = str(getattr(msg, "SenderName", "") or "알 수 없음").strip()
-                        unread = bool(getattr(msg, "UnRead", False))
                         clean_dt = extract_outlook_item_datetime(msg)
 
                         raw_body = ""
@@ -1085,11 +1088,8 @@ class OutlookWorker(QThread):
                             time_str = ""
 
                         summary_info = summarize_email_body(
-                            raw_body,
-                            subject,
-                            base_date=r_date,
-                            sender=sender,
-                            recv_date_label=recv_full_str
+                            raw_body, subject,
+                            base_date=r_date, sender=sender, recv_date_label=recv_full_str
                         )
 
                         emails.append({
@@ -1105,10 +1105,92 @@ class OutlookWorker(QThread):
                             "preview": summary_info["preview"],
                             "schedules": summary_info.get("schedules", []),
                             "analyzed_dates": summary_info.get("analyzed_dates", []),
+                            "folder": folder_name,
                         })
+                        if seen_ids is not None:
+                            seen_ids.add(entry_id)
                 except Exception:
                     pass
-                msg = items.GetPrevious() if use_reverse_iter else items.GetNext()
+                msg = items.GetPrevious() if use_reverse else items.GetNext()
+        except Exception:
+            pass
+        return emails
+
+    def run(self):
+        pythoncom = None
+        try:
+            import pythoncom as _pythoncom
+            import win32com.client
+            pythoncom = _pythoncom
+            pythoncom.CoInitialize()
+
+            try:
+                outlook, namespace, inbox, unread_total = self._connect_new_outlook(pythoncom, win32com.client)
+            except Exception:
+                outlook, namespace, inbox, unread_total = self._connect_classic_outlook(pythoncom, win32com.client)
+
+            today_date = datetime.now().date()
+            seen_ids = set()
+
+            # 1. Scan main inbox (recent items, all read/unread)
+            scan_limit = max(50, self.max_items + 10)
+            emails = self._scan_items(
+                inbox, today_date,
+                max_items=self.max_items + 20, scan_limit=scan_limit,
+                unread_only=False, folder_name="", seen_ids=seen_ids
+            )
+
+            # 2. Scan name-categorized subfolders for unread items only
+            def _scan_subfolders(parent_folder):
+                nonlocal unread_total
+                try:
+                    for sf in parent_folder.Folders:
+                        try:
+                            sf_name = str(getattr(sf, "Name", "")).strip()
+                            if sf_name.lower() in self._SKIP_FOLDER_NAMES:
+                                continue
+                            sf_unread = int(getattr(sf, "UnReadItemCount", 0))
+                            if sf_unread > 0:
+                                unread_total += sf_unread
+                                sub = self._scan_items(
+                                    sf, today_date,
+                                    max_items=sf_unread + 10, scan_limit=sf_unread + 15,
+                                    unread_only=True, folder_name=sf_name, seen_ids=seen_ids
+                                )
+                                emails.extend(sub)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Inbox subfolders (rules-based person folders)
+            _scan_subfolders(inbox)
+
+            # Store root-level folders (sometimes rules move mail outside inbox)
+            try:
+                for store in namespace.Stores:
+                    try:
+                        root_f = store.GetRootFolder()
+                        for rf in root_f.Folders:
+                            try:
+                                rf_name = str(getattr(rf, "Name", "")).strip()
+                                if rf_name.lower() in self._SKIP_FOLDER_NAMES:
+                                    continue
+                                rf_unread = int(getattr(rf, "UnReadItemCount", 0))
+                                if rf_unread > 0:
+                                    unread_total += rf_unread
+                                    sub = self._scan_items(
+                                        rf, today_date,
+                                        max_items=rf_unread + 10, scan_limit=rf_unread + 15,
+                                        unread_only=True, folder_name=rf_name, seen_ids=seen_ids
+                                    )
+                                    emails.extend(sub)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # Guarantee newest-first order
             emails.sort(key=lambda x: x.get("recv_sort_key", ""), reverse=True)
@@ -1515,13 +1597,7 @@ class DesktopWidget(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.update_window_flags()
 
-        pos = self.dm.data.get("topbar_pos")
-        if pos and isinstance(pos, list) and len(pos) == 2:
-            x = max(0, min(pos[0], screen.width() - self.bar_width))
-            y = max(0, min(pos[1], screen.height() - self.BAR_HEIGHT))
-            self.move(x, y)
-        else:
-            self.move(screen.x() + 6, screen.y() + 6)
+        self.move(screen.x() + 6, screen.y() + 6)
 
     def update_window_flags(self):
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowMinimizeButtonHint
@@ -2984,6 +3060,16 @@ class DesktopWidget(QMainWindow):
             )
             row.addWidget(sender_lbl)
 
+            folder_name = mail.get("folder", "")
+            if folder_name:
+                folder_pill = QLabel(f"📁 {folder_name}")
+                folder_pill.setStyleSheet(
+                    "color: #A78BFA; background: rgba(139,92,246,0.18); "
+                    "border: 1px solid rgba(139,92,246,0.35); border-radius: 4px; "
+                    "padding: 0 5px; font-size: 10px; font-weight: bold;"
+                )
+                row.addWidget(folder_pill)
+
             subj_lbl = QLabel(mail.get("subject", ""))
             subj_lbl.setFixedWidth(320)
             subj_lbl.setStyleSheet(
@@ -3765,17 +3851,19 @@ class DesktopWidget(QMainWindow):
             top_row.addWidget(c_btn)
 
         self.save_memo_btn = QPushButton("💾 저장")
-        self.save_memo_btn.setFixedHeight(26)
-        self.save_memo_btn.setToolTip("현재 메모 즉시 저장 (Ctrl+S)")
+        self.save_memo_btn.setFixedHeight(28)
+        self.save_memo_btn.setFixedWidth(72)
+        self.save_memo_btn.setToolTip("현재 메모 저장 (Ctrl+S)")
         self.save_memo_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.save_memo_btn.setShortcut("Ctrl+S")
         self.save_memo_btn.setStyleSheet("""
             QPushButton {
-                background: #10B981; color: #0F172A;
+                background: #10B981; color: #FFFFFF;
                 border-radius: 6px; padding: 0 10px;
-                font-size: 11px; font-weight: bold; border: none;
+                font-size: 12px; font-weight: bold; border: none;
             }
-            QPushButton:hover { background: #34D399; color: #0F172A; }
+            QPushButton:hover { background: #059669; color: #FFFFFF; }
+            QPushButton:pressed { background: #047857; }
         """)
         self.save_memo_btn.clicked.connect(self.save_current_memo_explicit)
         top_row.addWidget(self.save_memo_btn)
@@ -4208,11 +4296,29 @@ class DesktopWidget(QMainWindow):
         self.update_memo_date_filter_combo()
         self.render_memo_list()
         if hasattr(self, "save_memo_btn"):
-            self.save_memo_btn.setText("✅ 저장됨!")
-            QTimer.singleShot(
-                1400,
-                lambda: self.save_memo_btn.setText("💾 저장") if hasattr(self, "save_memo_btn") else None
-            )
+            self.save_memo_btn.setText("✅ 저장완료!")
+            self.save_memo_btn.setStyleSheet("""
+                QPushButton {
+                    background: #6366F1; color: #FFFFFF;
+                    border-radius: 6px; padding: 0 10px;
+                    font-size: 12px; font-weight: bold; border: none;
+                }
+            """)
+            QTimer.singleShot(1600, self._reset_save_btn_style)
+
+    def _reset_save_btn_style(self):
+        if not hasattr(self, "save_memo_btn"):
+            return
+        self.save_memo_btn.setText("💾 저장")
+        self.save_memo_btn.setStyleSheet("""
+            QPushButton {
+                background: #10B981; color: #FFFFFF;
+                border-radius: 6px; padding: 0 10px;
+                font-size: 12px; font-weight: bold; border: none;
+            }
+            QPushButton:hover { background: #059669; color: #FFFFFF; }
+            QPushButton:pressed { background: #047857; }
+        """)
 
     def create_new_memo(self):
         memos = self.ensure_memos_valid()
