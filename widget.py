@@ -1598,6 +1598,8 @@ class DesktopWidget(QMainWindow):
         self.update_window_flags()
 
         self.move(screen.x() + 6, screen.y() + 6)
+        # setWindowFlags() 후 OS가 위치를 재조정할 수 있으므로 이벤트 루프 시작 후 한 번 더 적용
+        QTimer.singleShot(0, lambda: self.move(screen.x() + 6, screen.y() + 6))
 
     def update_window_flags(self):
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowMinimizeButtonHint
